@@ -6,6 +6,7 @@ import pandas as pd
 import uuid
 from abc import ABC, abstractmethod
 from azure.storage.blob import BlobServiceClient
+from datetime import datetime
 
 app = func.FunctionApp()
 
@@ -52,7 +53,6 @@ class TelRaam(Converter, ABC):
             gridEndLong = float(zone_def.get("gridEndLong"))
             gridStartLong = float(zone_def.get("gridStartLong"))
 
-        uuid = json_dict["uuid"]
         statusCode = json_dict["statusCode"]
         if statusCode != 200:
             return -1, pd.DataFrame()
@@ -75,20 +75,29 @@ class TelRaam(Converter, ABC):
             if f["properties"]["uptime"] != '':
                 finalFeatures.append(f)
         
-        df = pd.DataFrame(columns=['latitude', 'longitude', 'period', 'uptime', 'heavy', 'car', 'bike', 'pedestrian', 'v85'])
+        df = pd.DataFrame(columns=['latitude', 'longitude', 'timeStamp', 'heavy', 'car', 'bike', 'pedestrian', 'v85'])
         for f in finalFeatures:
             coordinatesStart = f["geometry"]["coordinates"][0][0]
             coordinatesEnd = f["geometry"]["coordinates"][0][-1]
-            latitude = coordinatesStart
-            period = f["properties"]["period"]
-            uptime = f["properties"]["uptime"]
+            latitude = (coordinatesStart[1] + coordinatesEnd[1]) / 2
+            longitude = (coordinatesStart[0] + coordinatesEnd[0]) / 2
+            timeStamp = datetime.strptime(f["properties"]["last_data_package"], "%Y-%m-%d %H:%M:%S.%f%z").strftime("%Y-%m-%d %H:%M:%S")
             heavy = f["properties"]["heavy"]
             car = f["properties"]["car"]
             bike = f["properties"]["bike"]
             pedestrian = f["properties"]["pedestrian"]
             v85 = f["properties"]["v85"]
-            df.loc[len(df)] = [coordinatesStart, coordinatesEnd, period, uptime, heavy, car, bike, pedestrian, v85]
-        return "TelRaam", df
+            df.loc[len(df)] = [latitude, longitude, timeStamp, heavy, car, bike, pedestrian, v85]
+        
+        final_df = pd.DataFrame(columns=['uuid', 'timestamp', 'latitude', 'longitude', 'valueType', 'sensorDataValue'])
+        for index, row in df.iterrows():
+            final_df.loc[len(final_df)] = [uuid.uuid4(), row["timeStamp"], row["latitude"], row["longitude"], "HEAVY", row["heavy"]]
+            final_df.loc[len(final_df)] = [uuid.uuid4(), row["timeStamp"], row["latitude"], row["longitude"], "CAR", row["car"]]
+            final_df.loc[len(final_df)] = [uuid.uuid4(), row["timeStamp"], row["latitude"], row["longitude"], "BIKE", row["bike"]]
+            final_df.loc[len(final_df)] = [uuid.uuid4(), row["timeStamp"], row["latitude"], row["longitude"], "PEDESTRIAN", row["pedestrian"]]
+            final_df.loc[len(final_df)] = [uuid.uuid4(), row["timeStamp"], row["latitude"], row["longitude"], "V85", row["v85"]]
+
+        return "TelRaam", final_df
 
 class OpenSenseMap(Converter, ABC):
     def convert(self, json_dict):
