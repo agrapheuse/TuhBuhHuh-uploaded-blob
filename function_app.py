@@ -10,26 +10,46 @@ from datetime import datetime
 
 app = func.FunctionApp()
 
-@app.function_name(name="uploadedBlob")
-@app.blob_trigger(arg_name="obj", path="json/{name}",
-                               connection="MyStorageAccountConnection") 
-def uploadedBlob(obj: func.InputStream):
-    content = obj.read().decode('utf-8')
-    folder_name = os.path.basename(os.path.dirname(obj.name))
-    
-    api, df = convert(content, folder_name)
+@app.service_bus_queue_trigger(arg_name="message", queue_name="api-data-to-etl",
+                               connection="AzureWebJobsServiceBus") 
+def uploadedBlob(message: func.ServiceBusMessage):
+    folder_name = message.get_body().decode('utf-8')
+    logging.warning(f"Python ServiceBus queue trigger processed message: {folder_name}")
+    connection_string = "DefaultEndpointsProtocol=https;AccountName=datalaketuhbehhuh;AccountKey=C2te9RgBRHhIH8u3tydAsn9wNd4umdD2axq1ZdcfKh7CZRpL04+D4H6QinE/gckMTUA/dFj1kFpd+ASt4+/8ZA==;EndpointSuffix=core.windows.net"
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+    content = download_blob_to_file(blob_service_client, "json", folder_name)
+
+    folder_name = folder_name.split("/")[0]
+
+    logging.warning(f"Converting {folder_name} data")
+    api, df = convert(blob_service_client, content, folder_name)
     if df.empty:
         return
     else:
-        upload_blob(api, df)
+        upload_blob(blob_service_client, api, df)
 
-def convert(content, folder_name):
+def download_blob_to_file(blob_service_client: BlobServiceClient, container_name, blob_name):
+    logging.warning(f"Downloading blob: {blob_name} from container: {container_name}")
+    blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+    blob_data = blob_client.download_blob()
+    logging.warning(f"Succesfully downloaded blob: {blob_name}")
+
+    logging.warning(f"Converting blob to string")
+    json_content = blob_data.readall().decode('utf-8')
+    return json_content
+
+
+def convert(blob_service_client, content, folder_name):
     converter_class = converter_mapping.get(folder_name)
 
+    logging.warning('getting grid')
+    grid = download_blob_to_file(blob_service_client, "grid", "grid.csv")
+
     if converter_class:
+        logging.warning(f'Converter found: {converter_class}')
         converter_instance = converter_class()
         json_data = json.loads(content)
-        folder_name, df = converter_instance.convert(json_data)
+        folder_name, df = converter_instance.convert(json_data, grid)
         if folder_name == "-1":
             logging.warning(f'No csv file created for blob name: {folder_name}')
         return folder_name, df
@@ -42,7 +62,8 @@ class Converter:
         pass
 
 class TelRaam(Converter, ABC):
-    def convert(self, json_dict):
+    def convert(self, json_dict, grid):
+        logging.warning(f"Converting TelRaam data")
         grid_config_path = 'grid.config.json'
 
         with open(grid_config_path, 'r') as json_file:
@@ -58,7 +79,10 @@ class TelRaam(Converter, ABC):
             return -1, pd.DataFrame()
         
         timeSent = json_dict["timeSent"].replace(":", "-")
-        body = json.loads(json_dict["body"])
+        try:
+            body = json.loads(json_dict["body"])
+        except TypeError:
+            body = json_dict["body"]
         features = body["features"]
 
         keptFeatures = []
@@ -81,7 +105,10 @@ class TelRaam(Converter, ABC):
             coordinatesEnd = f["geometry"]["coordinates"][0][-1]
             latitude = (coordinatesStart[1] + coordinatesEnd[1]) / 2
             longitude = (coordinatesStart[0] + coordinatesEnd[0]) / 2
-            timeStamp = datetime.strptime(f["properties"]["last_data_package"], "%Y-%m-%d %H:%M:%S.%f%z").strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                timeStamp = datetime.strptime(f["properties"]["last_data_package"], "%Y-%m-%d %H:%M:%S.%f%z").strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                timeStamp = datetime.strptime(f["properties"]["last_data_package"], "%Y-%m-%d %H:%M:%S+00:00").strftime("%Y-%m-%d %H:%M:%S")
             heavy = f["properties"]["heavy"]
             car = f["properties"]["car"]
             bike = f["properties"]["bike"]
@@ -97,10 +124,13 @@ class TelRaam(Converter, ABC):
             final_df.loc[len(final_df)] = [uuid.uuid4(), row["timeStamp"], row["latitude"], row["longitude"], "PEDESTRIAN", row["pedestrian"]]
             final_df.loc[len(final_df)] = [uuid.uuid4(), row["timeStamp"], row["latitude"], row["longitude"], "V85", row["v85"]]
 
+        logging.warning(f"Succesfully converted TelRaam data")
+        logging.warning(f"Added {len(df)} rows to the dataframe")
         return "TelRaam", final_df
 
 class OpenSenseMap(Converter, ABC):
-    def convert(self, json_dict):
+    def convert(self, json_dict, grid):
+
         grid_config_path = 'grid.config.json'
 
         with open(grid_config_path, 'r') as json_file:
@@ -121,12 +151,11 @@ class OpenSenseMap(Converter, ABC):
         body = json.loads(json_dict["body"])
         print(uuid, timeSent, statusCode, body)
         '''
-        print(json_dict)
         return "OpenSenseMap", pd.DataFrame()
     
 class SensorCommunity(Converter, ABC):
-    def convert(self, json_dict):
-        
+    def convert(self, json_dict, grid):
+        logging.warning(f"Converting SensorCommunity data")
         grid_config_path = 'grid.config.json'
 
         with open(grid_config_path, 'r') as json_file:
@@ -141,8 +170,10 @@ class SensorCommunity(Converter, ABC):
         if statusCode != 200:
             return -1, pd.DataFrame()
         
-        timeSent = json_dict["timeSent"].replace(":", "-")
-        body = json.loads(json_dict["body"])
+        try:
+            body = json.loads(json_dict["body"])
+        except TypeError:
+            body = json_dict["body"]
 
         keptSensor = []
         for sensordata in body:
@@ -162,6 +193,8 @@ class SensorCommunity(Converter, ABC):
                 value = values["value"]
                 if value_type in ["temperature", "humidity", "P1", "P2"]:
                     df.loc[len(df)] = [uuid.uuid4(), timeStamp, lat, lon, value_type.upper(), value]
+        logging.warning(f"Succesfully converted SensorCommunity data")
+        logging.warning(f"Added {len(df)} rows to the dataframe")
         return "SensorCommunity", df
 
 converter_mapping = {
@@ -170,12 +203,11 @@ converter_mapping = {
     '017f12f5-8acb-4531-ab77-0e5208a31bca': SensorCommunity
 }
 
-def upload_blob(api, df):
-    connection_string = os.environ["MyStorageAccountConnection"]
-    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-    
+def upload_blob(blob_service_client, api, df):  
+    blob_uuid = uuid.uuid4()
+    logging.warning(f"Uploading {api}-{blob_uuid}.csv to blob storage")
     csv_string = df.to_csv(index=False)
-    blob_client = blob_service_client.get_blob_client(container="csv/latest", blob=f"{api}.csv")
+    blob_client = blob_service_client.get_blob_client(container="csv/latest", blob=f"{api}-{blob_uuid}.csv")
     
     blob_client.upload_blob(csv_string, blob_type="BlockBlob")
-    logging.info(f"uploaded {api}.csv to blob storage")
+    logging.warning(f"Succesfully uploaded {api}-{blob_uuid}.csv to blob storage")
